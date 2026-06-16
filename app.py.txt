@@ -1,0 +1,126 @@
+import streamlit as st
+import os
+import whisper
+import re
+import nltk
+import string
+import numpy as np
+import tensorflow_hub as hub
+from transformers import pipeline
+from sumy.parsers.plaintext import PlaintextParser
+from sumy.nlp.tokenizers import Tokenizer
+from sumy.summarizers.lsa import LsaSummarizer
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+from joblib import load
+from tensorflow.keras.models import load_model
+
+# Download required NLTK data
+nltk.download('punkt')
+nltk.download('punkt_tab')
+nltk.download('stopwords')
+nltk.download('wordnet')
+nltk.download('omw-1.4')
+
+# Set page config
+st.set_page_config(page_title="Speech Analysis App", layout="wide")
+
+# Initialize session state for model loading
+if 'whisper_model' not in st.session_state:
+    with st.spinner('Loading Whisper model...'):
+        st.session_state.whisper_model = whisper.load_model("small")
+
+if 'abstractive_summarizer' not in st.session_state:
+    with st.spinner('Loading BART model...'):
+        st.session_state.abstractive_summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+
+if 'summarizer' not in st.session_state:
+    st.session_state.summarizer = LsaSummarizer()
+
+if 'topic_model' not in st.session_state:
+    with st.spinner('Loading topic classification model...'):
+        st.session_state.topic_model = load_model('Deployment/model.keras')
+        st.session_state.encoder = load('Deployment/label_encoder.joblib')
+        st.session_state.embed = hub.load("https://tfhub.dev/google/nnlm-en-dim128/2")
+
+# Text preprocessing function
+def preprocess_text(text):
+    def to_lower(text):
+        return text.lower()
+
+    def remove_punctuation_numbers(text):
+        text = re.sub(r'\d+', '', text)
+        text = re.sub(r'\b(\d+)(st|nd|rd|th)\b', '', text)
+        return text.translate(str.maketrans('', '', string.punctuation))
+
+    def tokenize(text):
+        return nltk.word_tokenize(text)
+
+    stop_words = set(stopwords.words('english'))
+    def remove_stopwords(tokens):
+        return [word for word in tokens if word not in stop_words]
+
+    lemmatizer = WordNetLemmatizer()
+    def apply_lemmatization(tokens):
+        return [lemmatizer.lemmatize(word) for word in tokens]
+
+    text = to_lower(text)
+    text = remove_punctuation_numbers(text)
+    tokens = tokenize(text)
+    tokens = remove_stopwords(tokens)
+    tokens = apply_lemmatization(tokens)
+    return " ".join(tokens)
+
+# Summarization functions
+def abstractive_summary(text):
+    try:
+        summary = st.session_state.abstractive_summarizer(text, max_length=150, min_length=30, do_sample=False)[0]['summary_text']
+        return summary
+    except Exception as e:
+        return f"Error in abstractive summarization: {str(e)}"
+
+def extractive_summary(text):
+    try:
+        parser = PlaintextParser.from_string(text, Tokenizer("english"))
+        summary = st.session_state.summarizer(parser.document, 2)
+        return " ".join([str(sentence) for sentence in summary])
+    except Exception as e:
+        return f"Error in extractive summarization: {str(e)}"
+
+# Main app
+st.title("Speech Analysis App")
+
+# File input
+filepath = st.text_input("Enter the path to your audio file:")
+
+if filepath:
+    if os.path.exists(filepath):
+        with st.spinner('Processing audio file...'):
+            # Transcribe audio
+            data = st.session_state.whisper_model.transcribe(filepath)
+            text = data['text']
+            
+            # Preprocess text
+            processed_text = preprocess_text(text)
+            
+            # Display original transcription
+            st.subheader("Original Transcription")
+            st.write(text)
+            
+            # Generate and display summaries
+            st.subheader("Abstractive Summary")
+            abs_summary = abstractive_summary(processed_text)
+            st.write(abs_summary)
+            
+            st.subheader("Extractive Summary")
+            ext_summary = extractive_summary(processed_text)
+            st.write(ext_summary)
+            
+            # Predict topic
+            st.subheader("Topic Classification")
+            embed = st.session_state.embed([processed_text])
+            prediction = st.session_state.topic_model.predict(embed)
+            topic = st.session_state.encoder.inverse_transform(np.argmax(prediction, axis=1))[0]
+            st.write(f"Predicted Topic: {topic}")
+    else:
+        st.error("File not found. Please enter a valid file path.") 
